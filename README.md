@@ -284,12 +284,10 @@ Wait for the program to finish. It will display the result and create a file nam
 
 # What should the answer look like?
 
-The program generates **10 rows**, one for each evaluation query. Each row contains seven values:
+The program generates **10 rows**, one for each evaluation query. Each row contains seven values. The generated `answer.json` is written as **one compact line**, with no extra spaces or line breaks:
 
 ```json
-[
-  [idx_a1, idx_a2, idx_a3, idx_b1, idx_b2, idx_b3, rho]
-]
+[[idx_a1,idx_a2,idx_a3,idx_b1,idx_b2,idx_b3,rho],[idx_a1,idx_a2,idx_a3,idx_b1,idx_b2,idx_b3,rho]]
 ```
 
 - Values 1–3: the top three document indices returned by `nomic-embed-text`.
