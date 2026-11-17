@@ -25,7 +25,7 @@ pip install -r requirements.txt
    .\.venv\Scripts\Activate.ps1
    ```
 
-3. Open Ollama and keep it running. In PowerShell, download the models:
+3. Open Ollama and keep it running; it normally starts the service automatically. If it is not running, open a **second PowerShell window**, run `ollama serve`, and leave that window open. In the first PowerShell window, download the models:
 
 ```powershell
 ollama pull nomic-embed-text
@@ -66,7 +66,7 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-3. Make sure the Ollama service is running, then download both models:
+3. Make sure the Ollama service is running. If it is not already running as a system service, open a **second terminal**, run `ollama serve`, and leave that terminal open. In your first terminal, download both models:
 
 ```bash
 ollama pull nomic-embed-text
@@ -100,7 +100,7 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-3. Open Ollama and keep it running. In Terminal, download both models:
+3. Open Ollama and keep it running; it normally starts the service automatically. If it is not running, open a **second Terminal window**, run `ollama serve`, and leave that window open. In the first Terminal window, download both models:
 
 ```bash
 ollama pull nomic-embed-text
@@ -119,7 +119,7 @@ python solve.py
 
 ## If something goes wrong
 
-- **Ollama connection error:** Open/start Ollama and keep it running while the script runs.
+- **Ollama connection error:** Start Ollama. If the application/service has not started it automatically, run `ollama serve` in a separate terminal window and leave it running while the script runs.
 - **Model not found:** Run the two `ollama pull` commands again.
 - **Python package missing:** Activate `.venv` and run `pip install -r requirements.txt`.
 - **Dataset not found:** Make sure `dataset.json` is in the same folder as `solve.py`.
