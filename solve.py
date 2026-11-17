@@ -172,11 +172,13 @@ def main():
         if not np.isfinite(row[6]) or not -1 <= row[6] <= 1:
             raise RuntimeError(f"Invalid Spearman rho in output row {number}.")
 
+    # Compact JSON: no indentation or unnecessary whitespace.
+    compact_json = json.dumps(matrix, separators=(",", ":"))
     output_path = Path(args.output)
-    output_path.write_text(json.dumps(matrix, indent=2) + "\n", encoding="utf-8")
+    output_path.write_text(compact_json, encoding="utf-8")
 
     print("\nFinal result:")
-    print(json.dumps(matrix, indent=2))
+    print(compact_json)
     print(f"\nSaved {len(matrix)} rows to: {output_path.resolve()}")
     print("For the GA5 assignment, check that your input is the official dataset and")
     print("that the output dimensions and rho values satisfy the grader's requirements.")
