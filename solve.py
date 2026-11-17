@@ -1,4 +1,10 @@
+#!/usr/bin/env python3
+"""Compare two Ollama embedding models on a JSON corpus using FAISS and Spearman rho."""
+
+import argparse
 import json
+import os
+import sys
 from pathlib import Path
 
 import faiss
@@ -6,172 +12,179 @@ import numpy as np
 import requests
 from scipy.stats import spearmanr
 
-# --------------------------------------------------
-# Configuration
-# --------------------------------------------------
-
-DATASET_PATH = Path("dataset.json")
-OUTPUT_PATH = Path("answer.json")
-OLLAMA_URL = "http://localhost:11434/api/embed"
-
-MODEL_A = "nomic-embed-text"
-MODEL_B = "mxbai-embed-large"
+DEFAULT_INPUT = "dataset.json"
+DEFAULT_OUTPUT = "answer.json"
+DEFAULT_OLLAMA_URL = "http://localhost:11434"
+DEFAULT_MODEL_A = "nomic-embed-text"
+DEFAULT_MODEL_B = "mxbai-embed-large"
 
 
-# --------------------------------------------------
-# 1. LOAD DATASET
-# --------------------------------------------------
-
-with DATASET_PATH.open("r", encoding="utf-8") as f:
-    data = json.load(f)
-
-sentences = data["sentences"]
-queries = data["queries"]
-
-print("Sentences:", len(sentences))
-print("Queries:", len(queries))
-
-assert len(sentences) == 50, "Expected exactly 50 corpus sentences."
-assert len(queries) == 10, "Expected exactly 10 evaluation queries."
-
-
-# --------------------------------------------------
-# 2. GENERATE AND NORMALIZE EMBEDDINGS
-# --------------------------------------------------
-
-def get_embeddings(model_name, texts):
-    """Embed a list of texts using Ollama's /api/embed endpoint."""
-    response = requests.post(
-        OLLAMA_URL,
-        json={
-            "model": model_name,
-            "input": texts,
-        },
-        timeout=300,
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Compare two Ollama embedding models on documents and queries."
     )
-    response.raise_for_status()
+    parser.add_argument("--input", default=DEFAULT_INPUT, help="Input JSON file (default: dataset.json)")
+    parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Output JSON file (default: answer.json)")
+    parser.add_argument("--model-a", default=os.getenv("MODEL_A", DEFAULT_MODEL_A))
+    parser.add_argument("--model-b", default=os.getenv("MODEL_B", DEFAULT_MODEL_B))
+    parser.add_argument("--ollama-url", default=os.getenv("OLLAMA_URL", DEFAULT_OLLAMA_URL),
+                        help="Ollama server base URL (default: http://localhost:11434)")
+    return parser.parse_args()
 
-    result = response.json()
-    embeddings = np.asarray(result["embeddings"], dtype=np.float32)
 
-    if embeddings.ndim != 2 or len(embeddings) != len(texts):
-        raise ValueError(
-            f"Unexpected embedding shape from {model_name}: {embeddings.shape}"
+def load_dataset(path):
+    """Load documents/sentences and queries from a JSON object."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise ValueError(f"Input file not found: {path}") from None
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON in {path}: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise ValueError("The JSON root must be an object.")
+
+    # Accept both the assignment's original key and the more general alias.
+    documents = data.get("sentences", data.get("documents"))
+    queries = data.get("queries")
+
+    if not isinstance(documents, list) or not documents:
+        raise ValueError('JSON must contain a non-empty "sentences" or "documents" array.')
+    if len(documents) < 3:
+        raise ValueError("At least 3 documents are required to return a top-3 ranking.")
+    if not isinstance(queries, list) or not queries:
+        raise ValueError('JSON must contain a non-empty "queries" array.')
+
+    for field, values in (("documents/sentences", documents), ("queries", queries)):
+        if any(not isinstance(value, str) or not value.strip() for value in values):
+            raise ValueError(f'Every item in "{field}" must be a non-empty string.')
+
+    return documents, queries
+
+
+def get_embeddings(model_name, texts, ollama_url):
+    """Embed a batch of texts with Ollama and return normalized float32 vectors."""
+    endpoint = f"{ollama_url.rstrip('/')}/api/embed"
+    try:
+        response = requests.post(
+            endpoint,
+            json={"model": model_name, "input": texts},
+            timeout=600,
         )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"Could not get embeddings from {endpoint} using {model_name}: {exc}\n"
+            "Check that Ollama is running and that the model has been pulled."
+        ) from exc
 
-    if not np.isfinite(embeddings).all():
-        raise ValueError(f"{model_name} returned non-finite embedding values.")
+    try:
+        payload = response.json()
+        embeddings = np.asarray(payload["embeddings"], dtype=np.float32)
+    except (ValueError, KeyError, TypeError) as exc:
+        raise RuntimeError(f"Unexpected embedding response from model {model_name}.") from exc
 
-    # Normalize every vector to unit length. Inner product then equals cosine
-    # similarity (apart from floating-point precision).
+    if embeddings.ndim != 2 or embeddings.shape[0] != len(texts):
+        raise RuntimeError(
+            f"{model_name} returned shape {embeddings.shape}; "
+            f"expected {len(texts)} embedding vectors."
+        )
+    if embeddings.shape[1] == 0 or not np.isfinite(embeddings).all():
+        raise RuntimeError(f"{model_name} returned empty or non-finite embedding values.")
+
     faiss.normalize_L2(embeddings)
     return embeddings
 
 
-# --------------------------------------------------
-# 3. EMBED THE CORPUS WITH BOTH MODELS
-# --------------------------------------------------
-
-print("\nGenerating Nomic document embeddings...")
-emb_a = get_embeddings(MODEL_A, sentences)
-print("Nomic embeddings:", emb_a.shape)
-
-print("\nGenerating Mxbai document embeddings...")
-emb_b = get_embeddings(MODEL_B, sentences)
-print("Mxbai embeddings:", emb_b.shape)
+def build_index(embeddings):
+    index = faiss.IndexFlatIP(embeddings.shape[1])
+    index.add(embeddings)
+    return index
 
 
-# --------------------------------------------------
-# 4. BUILD TWO INDEPENDENT FAISS INDEXES
-# --------------------------------------------------
+def main():
+    args = parse_args()
+    documents, queries = load_dataset(args.input)
 
-index_a = faiss.IndexFlatIP(emb_a.shape[1])
-index_a.add(emb_a)
+    print(f"Loaded {len(documents)} documents and {len(queries)} queries.")
+    print(f"Model A: {args.model_a}")
+    print(f"Model B: {args.model_b}")
 
-index_b = faiss.IndexFlatIP(emb_b.shape[1])
-index_b.add(emb_b)
+    print("\nEmbedding documents with model A...")
+    docs_a = get_embeddings(args.model_a, documents, args.ollama_url)
+    print("Embedding documents with model B...")
+    docs_b = get_embeddings(args.model_b, documents, args.ollama_url)
 
-print("\nFAISS indexes created successfully.")
+    if docs_a.shape[1] != docs_b.shape[1]:
+        print(
+            "Note: the models use different vector dimensions "
+            f"({docs_a.shape[1]} and {docs_b.shape[1]}). "
+            "This is fine because each model has its own FAISS index."
+        )
 
+    index_a = build_index(docs_a)
+    index_b = build_index(docs_b)
 
-# --------------------------------------------------
-# 5. EMBED ALL EVALUATION QUERIES
-# --------------------------------------------------
+    print("\nEmbedding queries with model A...")
+    query_a = get_embeddings(args.model_a, queries, args.ollama_url)
+    print("Embedding queries with model B...")
+    query_b = get_embeddings(args.model_b, queries, args.ollama_url)
 
-print("\nGenerating query embeddings...")
-query_a = get_embeddings(MODEL_A, queries)
-query_b = get_embeddings(MODEL_B, queries)
+    if query_a.shape[1] != docs_a.shape[1]:
+        raise RuntimeError(f"{args.model_a} returned different dimensions for documents and queries.")
+    if query_b.shape[1] != docs_b.shape[1]:
+        raise RuntimeError(f"{args.model_b} returned different dimensions for documents and queries.")
 
+    matrix = []
+    for query_number in range(len(queries)):
+        print(f"Searching query {query_number + 1}/{len(queries)}...")
+        distances_a, indices_a = index_a.search(query_a[query_number:query_number + 1], len(documents))
+        distances_b, indices_b = index_b.search(query_b[query_number:query_number + 1], len(documents))
 
-# --------------------------------------------------
-# 6. SEARCH AND CALCULATE SPEARMAN'S RHO
-# --------------------------------------------------
+        top3_a = indices_a[0][:3].astype(int).tolist()
+        top3_b = indices_b[0][:3].astype(int).tolist()
 
-matrix = []
+        # Restore scores to original document order before comparing rankings.
+        scores_a = np.empty(len(documents), dtype=np.float64)
+        scores_b = np.empty(len(documents), dtype=np.float64)
+        scores_a[indices_a[0]] = distances_a[0]
+        scores_b[indices_b[0]] = distances_b[0]
 
-for q in range(len(queries)):
-    print(f"\nProcessing query {q + 1}/{len(queries)}")
+        rho = float(spearmanr(scores_a, scores_b).statistic)
+        if not np.isfinite(rho):
+            raise RuntimeError(
+                f"Spearman correlation was undefined for query {query_number + 1}."
+            )
 
-    # Search all 50 corpus documents so correlation uses the full ranking.
-    distances_a, indices_a = index_a.search(query_a[q:q + 1], len(sentences))
-    distances_b, indices_b = index_b.search(query_b[q:q + 1], len(sentences))
+        matrix.append(top3_a + top3_b + [round(rho, 4)])
 
-    top3_a = indices_a[0][:3].tolist()
-    top3_b = indices_b[0][:3].tolist()
+    # Structural checks. The assignment-specific grader may impose additional
+    # dimensions or thresholds; this script does not assume every user's file
+    # has exactly 50 documents and 10 queries.
+    if len(matrix) != len(queries) or any(len(row) != 7 for row in matrix):
+        raise RuntimeError("Internal error: output matrix has an unexpected shape.")
 
-    # Put similarity scores back into original corpus order (document 0..49).
-    scores_a = np.zeros(len(sentences), dtype=np.float64)
-    scores_b = np.zeros(len(sentences), dtype=np.float64)
+    for number, row in enumerate(matrix, start=1):
+        if any(not isinstance(i, int) or not 0 <= i < len(documents) for i in row[:6]):
+            raise RuntimeError(f"Invalid document index in output row {number}.")
+        if len(set(row[:3])) != 3 or len(set(row[3:6])) != 3:
+            raise RuntimeError(f"Duplicate top-3 document index in output row {number}.")
+        if not np.isfinite(row[6]) or not -1 <= row[6] <= 1:
+            raise RuntimeError(f"Invalid Spearman rho in output row {number}.")
 
-    scores_a[indices_a[0]] = distances_a[0]
-    scores_b[indices_b[0]] = distances_b[0]
+    output_path = Path(args.output)
+    output_path.write_text(json.dumps(matrix, indent=2) + "\n", encoding="utf-8")
 
-    # Spearman correlation compares the two complete 50-document rankings.
-    rho, _ = spearmanr(scores_a, scores_b)
-    rho = round(float(rho), 4)
-
-    row = [
-        int(top3_a[0]), int(top3_a[1]), int(top3_a[2]),
-        int(top3_b[0]), int(top3_b[1]), int(top3_b[2]),
-        rho,
-    ]
-    matrix.append(row)
-
-
-# --------------------------------------------------
-# 7. VALIDATE THE SUBMISSION MATRIX
-# --------------------------------------------------
-
-assert len(matrix) == 10, "Output must contain 10 rows."
-
-for row_number, row in enumerate(matrix, start=1):
-    assert len(row) == 7, f"Row {row_number} must contain 7 values."
-
-    indices = row[:6]
-    assert all(
-        isinstance(i, int) and 0 <= i < 50 for i in indices
-    ), f"Invalid document index in row {row_number}."
-
-    assert len(set(row[:3])) == 3, f"Model A top-3 has duplicates in row {row_number}."
-    assert len(set(row[3:6])) == 3, f"Model B top-3 has duplicates in row {row_number}."
-
-    assert np.isfinite(row[6]) and -1.0 <= row[6] <= 1.0
-    assert row[6] < 0.95, (
-        f"Correlation in row {row_number} is >= 0.95. "
-        "Check that two different embedding models were used."
-    )
+    print("\nFinal result:")
+    print(json.dumps(matrix, indent=2))
+    print(f"\nSaved {len(matrix)} rows to: {output_path.resolve()}")
+    print("For the GA5 assignment, check that your input is the official dataset and")
+    print("that the output dimensions and rho values satisfy the grader's requirements.")
 
 
-# --------------------------------------------------
-# 8. PRINT AND SAVE THE FINAL JSON
-# --------------------------------------------------
-
-output = json.dumps(matrix, indent=2)
-
-print("\n" + "=" * 60)
-print("FINAL 10 x 7 SUBMISSION MATRIX")
-print("=" * 60)
-print(output)
-
-OUTPUT_PATH.write_text(output + "\n", encoding="utf-8")
-print(f"\nSaved successfully to {OUTPUT_PATH}")
+if __name__ == "__main__":
+    try:
+        main()
+    except (ValueError, RuntimeError) as exc:
+        print(f"\nERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
